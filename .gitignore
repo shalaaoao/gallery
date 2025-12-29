@@ -1,0 +1,37 @@
+# 编译后的二进制文件
+gallery
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 证书文件（敏感信息，不应提交）
+*.pem
+*.key
+*.crt
+*.cert
+
+# Go 测试文件
+*.test
+*.out
+
+# Go 依赖目录
+vendor/
+
+# IDE 配置文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 临时文件
+*.tmp
+*.log
+
+# 系统文件
+._*
+Thumbs.db
+
