@@ -28,8 +28,8 @@ const (
 	PhotoRoot = "/mnt/Fanxiang2T/canon/"
 	Port      = ":8092"
 	PageSize  = 20
-	CertFile  = "cert.pem"
-	KeyFile   = "key.pem"
+	CertFile  = "/home/wwwroot/dnmp_linux/services/nginx/ssl/julyaoao.top/cert.crt"
+	KeyFile   = "/home/wwwroot/dnmp_linux/services/nginx/ssl/julyaoao.top/cert.key"
 )
 
 // =========================================
