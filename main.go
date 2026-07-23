@@ -21,15 +21,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/disintegration/imaging"
 )
 
 // ================= 配置区 =================
 const (
-	PhotoRoot = "/mnt/Fanxiang2T/canon/"
-	Port      = ":8092"
-	PageSize  = 20
-	CertFile  = "/home/wwwroot/dnmp_linux/services/nginx/ssl/julyaoao.top/cert.crt"
-	KeyFile   = "/home/wwwroot/dnmp_linux/services/nginx/ssl/julyaoao.top/cert.key"
+	PhotoRoot    = "/mnt/Fanxiang2T/canon/"
+	Port         = ":8092"
+	PageSize     = 20
+	CertFile     = "/home/wwwroot/dnmp_linux/services/nginx/ssl/julyaoao.top/cert.crt"
+	KeyFile      = "/home/wwwroot/dnmp_linux/services/nginx/ssl/julyaoao.top/cert.key"
+	ThumbMaxSize = 600               // 缩略图最大边长（像素）
+	JPEGQuality  = 82                // 缩略图 JPEG 质量（1-100）
 )
 
 // =========================================
@@ -63,6 +67,7 @@ func main() {
 
 	fs := http.FileServer(http.Dir(PhotoRoot))
 	http.Handle("/raw/", http.StripPrefix("/raw/", fs))
+	http.HandleFunc("/thumb/", handleThumbnail)
 
 	http.HandleFunc("/sw.js", handleServiceWorker)
 	http.HandleFunc("/", handleGallery)
@@ -198,6 +203,67 @@ func handleGallery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tmpl.Execute(w, data)
+}
+
+// handleThumbnail 生成并缓存缩略图，首次访问时从原图生成，之后直接返回缓存。
+func handleThumbnail(w http.ResponseWriter, r *http.Request) {
+	// 从 URL 中提取原图的相对路径: /thumb/path/to/photo.jpg -> path/to/photo.jpg
+	relPath := strings.TrimPrefix(r.URL.Path, "/thumb/")
+
+	if strings.Contains(relPath, "..") {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+
+	origPath := filepath.Join(PhotoRoot, relPath)
+	if _, err := os.Stat(origPath); os.IsNotExist(err) {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	// 缩略图缓存路径: PhotoRoot/.thumbnails/ + 相对路径
+	thumbPath := filepath.Join(PhotoRoot, ".thumbnails", relPath)
+
+	// 如果缓存已存在，直接返回
+	if info, err := os.Stat(thumbPath); err == nil && !info.IsDir() {
+		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+		http.ServeFile(w, r, thumbPath)
+		return
+	}
+
+	// 确保缓存目录存在
+	thumbDir := filepath.Dir(thumbPath)
+	if err := os.MkdirAll(thumbDir, 0755); err != nil {
+		// 无法创建缓存目录，回退到原图
+		http.ServeFile(w, r, origPath)
+		return
+	}
+
+	// 解码原图并生成缩略图（imaging 自动处理 EXIF 方向）
+	img, err := imaging.Open(origPath, imaging.AutoOrientation(true))
+	if err != nil {
+		// 解码失败，回退到原图
+		http.ServeFile(w, r, origPath)
+		return
+	}
+
+	// 等比缩放，适应 ThumbMaxSize 范围
+	thumb := imaging.Fit(img, ThumbMaxSize, ThumbMaxSize, imaging.Lanczos)
+
+	// 先写到临时文件，再原子重命名，避免并发写入问题
+	tmpPath := thumbPath + ".tmp"
+	if err := imaging.Save(thumb, tmpPath, imaging.JPEGQuality(JPEGQuality)); err != nil {
+		http.ServeFile(w, r, origPath)
+		return
+	}
+	if err := os.Rename(tmpPath, thumbPath); err != nil {
+		// 重命名失败（可能被其他 goroutine 抢先创建），直接用临时文件响应
+		http.ServeFile(w, r, tmpPath)
+		return
+	}
+
+	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	http.ServeFile(w, r, thumbPath)
 }
 
 func handleServiceWorker(w http.ResponseWriter, r *http.Request) {
@@ -466,8 +532,8 @@ const htmlTemplate = `
 <div class="photo-grid" id="gallery">
     {{$curr := .CurrentPath}}
     {{range .Photos}}
-        <div class="photo-card" onclick="openLightbox('/raw/{{if $curr}}{{$curr}}/{{end}}{{.}}')">
-            <img src="/raw/{{if $curr}}{{$curr}}/{{end}}{{.}}" alt="{{.}}">
+        <div class="photo-card" data-raw-src="/raw/{{if $curr}}{{$curr}}/{{end}}{{.}}" onclick="openLightbox('/raw/{{if $curr}}{{$curr}}/{{end}}{{.}}')">
+            <img src="/thumb/{{if $curr}}{{$curr}}/{{end}}{{.}}" alt="{{.}}" loading="lazy">
             <div class="photo-name">{{.}}</div>
         </div>
     {{end}}
@@ -612,19 +678,24 @@ const htmlTemplate = `
 
             if (data.photos && data.photos.length > 0) {
                 data.photos.forEach(photoName => {
-                    let src = '/raw/';
-                    if (currentPath) src += currentPath + '/';
-                    src += photoName;
+                    var rawSrc = '/raw/';
+                    var thumbSrc = '/thumb/';
+                    if (currentPath) {
+                        rawSrc += currentPath + '/';
+                        thumbSrc += currentPath + '/';
+                    }
+                    rawSrc += photoName;
+                    thumbSrc += photoName;
 
                     const card = document.createElement('div');
                     card.className = 'photo-card';
-                    // FIX: 这里也改成了箭头函数，避免复杂的字符串拼接
-                    card.onclick = function() { openLightbox(src); };
-                    
+                    card.dataset.rawSrc = rawSrc;
+                    card.onclick = function() { openLightbox(rawSrc); };
+
                     const img = document.createElement('img');
                     img.loading = "lazy";
                     img.alt = photoName;
-                    img.src = src;
+                    img.src = thumbSrc;
 
                     const nameDiv = document.createElement('div');
                     nameDiv.className = 'photo-name';
@@ -664,8 +735,8 @@ const htmlTemplate = `
     let currentIndex = 0;
 
     function updateLightboxList() {
-        const imgs = document.querySelectorAll('.photo-card img');
-        currentImages = Array.from(imgs).map(img => img.src);
+        const cards = document.querySelectorAll('.photo-card');
+        currentImages = Array.from(cards).map(card => card.dataset.rawSrc);
     }
 
     function openLightbox(src) {
