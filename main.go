@@ -72,7 +72,7 @@ func main() {
 	http.HandleFunc("/sw.js", handleServiceWorker)
 	http.HandleFunc("/", handleGallery)
 
-	fmt.Printf("\n🚀 无限滚动版相册已启动\n")
+	fmt.Printf("\n🚀 Canon Gallery 相册 (v2.3)\n")
 	fmt.Printf("👉 请访问: https://192.168.100.15%s\n", Port)
 
 	err := http.ListenAndServeTLS(Port, CertFile, KeyFile, nil)
@@ -85,6 +85,8 @@ func handleGallery(w http.ResponseWriter, r *http.Request) {
 	if r.TLS != nil {
 		w.Header().Set("Protocol", "HTTP/2.0")
 	}
+	// 防止浏览器缓存旧版 HTML（确保 /thumb/ 改动生效）
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 
 	relPath := r.URL.Query().Get("path")
 	pageStr := r.URL.Query().Get("page")
@@ -210,6 +212,8 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	// 从 URL 中提取原图的相对路径: /thumb/path/to/photo.jpg -> path/to/photo.jpg
 	relPath := strings.TrimPrefix(r.URL.Path, "/thumb/")
 
+	log.Printf("📷 /thumb/ 请求: %s", relPath)
+
 	if strings.Contains(relPath, "..") {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
@@ -217,6 +221,7 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 
 	origPath := filepath.Join(PhotoRoot, relPath)
 	if _, err := os.Stat(origPath); os.IsNotExist(err) {
+		log.Printf("❌ 原图不存在: %s", origPath)
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
 	}
@@ -226,6 +231,7 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 
 	// 如果缓存已存在，直接返回
 	if info, err := os.Stat(thumbPath); err == nil && !info.IsDir() {
+		log.Printf("✅ 缓存命中: %s", relPath)
 		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 		http.ServeFile(w, r, thumbPath)
 		return
@@ -234,14 +240,17 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	// 确保缓存目录存在
 	thumbDir := filepath.Dir(thumbPath)
 	if err := os.MkdirAll(thumbDir, 0755); err != nil {
+		log.Printf("❌ 创建缓存目录失败: %s (err: %v)", thumbDir, err)
 		// 无法创建缓存目录，回退到原图
 		http.ServeFile(w, r, origPath)
 		return
 	}
 
 	// 解码原图并生成缩略图（imaging 自动处理 EXIF 方向）
+	log.Printf("🔧 正在生成缩略图: %s", relPath)
 	img, err := imaging.Open(origPath, imaging.AutoOrientation(true))
 	if err != nil {
+		log.Printf("❌ 解码失败: %s (err: %v)", origPath, err)
 		// 解码失败，回退到原图
 		http.ServeFile(w, r, origPath)
 		return
@@ -251,17 +260,22 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	thumb := imaging.Fit(img, ThumbMaxSize, ThumbMaxSize, imaging.Lanczos)
 
 	// 先写到临时文件，再原子重命名，避免并发写入问题
-	tmpPath := thumbPath + ".tmp"
+	// 注意: 临时文件必须是 .jpg 后缀，否则 imaging.Save 无法识别格式
+	ext := filepath.Ext(thumbPath) // 如 .JPG
+	tmpPath := strings.TrimSuffix(thumbPath, ext) + ".tmp" + ext
 	if err := imaging.Save(thumb, tmpPath, imaging.JPEGQuality(JPEGQuality)); err != nil {
+		log.Printf("❌ 保存缩略图失败: %s (err: %v)", tmpPath, err)
 		http.ServeFile(w, r, origPath)
 		return
 	}
 	if err := os.Rename(tmpPath, thumbPath); err != nil {
+		log.Printf("⚠️  重命名失败 (可能并发): %s -> %s (err: %v)", tmpPath, thumbPath, err)
 		// 重命名失败（可能被其他 goroutine 抢先创建），直接用临时文件响应
 		http.ServeFile(w, r, tmpPath)
 		return
 	}
 
+	log.Printf("✅ 缩略图生成完毕: %s", relPath)
 	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 	http.ServeFile(w, r, thumbPath)
 }
@@ -314,140 +328,25 @@ func generateCert(certPath, keyPath string) error {
 }
 
 // ---------------- Service Worker 脚本 ----------------
-// 这个 Service Worker 会在浏览器本地缓存图片，缓存1天后自动清理并释放空间
+// 轻量 Service Worker：不缓存任何内容，仅用于激活后快速清理旧缓存
 const serviceWorkerScript = `
-const CACHE_NAME = 'gallery-photos-v1';
-const CACHE_DURATION = 24 * 60 * 60 * 1000; // 1天（毫秒）
-
-// 检查缓存是否过期
-function isCacheExpired(cachedTime) {
-    if (!cachedTime) return true;
-    const age = Date.now() - parseInt(cachedTime);
-    return age >= CACHE_DURATION;
-}
-
-// 清理过期缓存并释放空间
-async function cleanExpiredCache() {
-    try {
-        const cache = await caches.open(CACHE_NAME);
-        const keys = await cache.keys();
-        const deletePromises = [];
-        
-        for (const request of keys) {
-            const response = await cache.match(request);
-            if (response) {
-                const cachedTime = response.headers.get('sw-cached-time');
-                if (isCacheExpired(cachedTime)) {
-                    // 删除过期缓存，释放空间
-                    deletePromises.push(cache.delete(request));
-                }
-            }
-        }
-        
-        // 等待所有删除操作完成
-        await Promise.all(deletePromises);
-        console.log('已清理过期缓存，释放空间:', deletePromises.length, '个文件');
-    } catch (error) {
-        console.error('清理缓存失败:', error);
-    }
-}
-
-// 安装 Service Worker
 self.addEventListener('install', (event) => {
     self.skipWaiting();
 });
 
-// 激活 Service Worker，立即清理过期缓存
 self.addEventListener('activate', (event) => {
     event.waitUntil(
         Promise.all([
-            // 删除旧版本的缓存
+            // 删除所有旧版本缓存，释放空间
             caches.keys().then((cacheNames) => {
                 return Promise.all(
-                    cacheNames.map((cacheName) => {
-                        if (cacheName !== CACHE_NAME) {
-                            return caches.delete(cacheName);
-                        }
-                    })
+                    cacheNames.map((cacheName) => caches.delete(cacheName))
                 );
             }),
-            // 清理当前缓存中的过期项
-            cleanExpiredCache(),
-            // 声明控制权
             self.clients.claim()
         ])
     );
 });
-
-// 拦截图片请求，实现浏览器本地缓存
-self.addEventListener('fetch', (event) => {
-    const url = new URL(event.request.url);
-    
-    // 只缓存 /raw/ 路径下的图片
-    if (url.pathname.startsWith('/raw/')) {
-        event.respondWith(
-            caches.open(CACHE_NAME).then((cache) => {
-                return cache.match(event.request).then((cachedResponse) => {
-                    // 如果有缓存，检查是否过期
-                    if (cachedResponse) {
-                        const cachedTime = cachedResponse.headers.get('sw-cached-time');
-                        if (cachedTime && !isCacheExpired(cachedTime)) {
-                            // 缓存未过期，直接从浏览器本地缓存返回
-                            return cachedResponse;
-                        } else {
-                            // 缓存已过期，立即删除以释放空间
-                            cache.delete(event.request).catch(() => {});
-                        }
-                    }
-                    
-                    // 从网络获取新图片
-                    return fetch(event.request).then((response) => {
-                        // 只缓存成功的响应
-                        if (response.status === 200) {
-                            // 克隆响应以便缓存
-                            const responseClone = response.clone();
-                            
-                            // 创建带时间戳的响应用于缓存
-                            const newHeaders = new Headers(response.headers);
-                            newHeaders.set('sw-cached-time', Date.now().toString());
-                            
-                            const cachedResponse = new Response(responseClone.body, {
-                                status: response.status,
-                                statusText: response.statusText,
-                                headers: newHeaders
-                            });
-                            
-                            // 将图片保存到浏览器本地缓存
-                            cache.put(event.request, cachedResponse);
-                        }
-                        return response;
-                    }).catch(() => {
-                        // 网络失败时，如果有旧缓存（即使过期），也返回
-                        if (cachedResponse) {
-                            return cachedResponse;
-                        }
-                        throw new Error('Network error and no cache');
-                    });
-                });
-            })
-        );
-    }
-});
-
-// 监听消息，支持手动触发清理
-self.addEventListener('message', (event) => {
-    if (event.data && event.data.type === 'CLEAN_CACHE') {
-        cleanExpiredCache().then(() => {
-            event.ports[0].postMessage({ success: true });
-        });
-    }
-});
-
-// 定期清理过期缓存（每30分钟检查一次，确保及时释放空间）
-// 注意：Service Worker 可能被休眠，但每次激活时会自动清理
-setInterval(() => {
-    cleanExpiredCache();
-}, 30 * 60 * 1000);
 `
 
 // ---------------- HTML 模板 ----------------
@@ -497,13 +396,14 @@ const htmlTemplate = `
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         .loading .spinner { display: block; }
 
-        #lightbox { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 100; justify-content: center; align-items: center; }
-        #lightbox img { max-width: 95%; max-height: 95%; }
-        #lb-close { position: absolute; top: 20px; right: 30px; color: #fff; font-size: 40px; cursor: pointer; }
-        .lb-nav { position: absolute; top: 50%; color: #fff; font-size: 50px; cursor: pointer; padding: 20px; transform: translateY(-50%); opacity: 0.5; }
+        #lightbox { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 100; }
+        #lb-close { position: absolute; top: 20px; right: 30px; color: #fff; font-size: 40px; cursor: pointer; z-index: 101; }
+        .lb-nav { position: absolute; top: 50%; color: #fff; font-size: 50px; cursor: pointer; padding: 20px; transform: translateY(-50%); opacity: 0.5; z-index: 101; user-select: none; }
         .lb-nav:hover { opacity: 1; }
         .lb-prev { left: 10px; }
         .lb-next { right: 10px; }
+        #lb-slider { position: absolute; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden; }
+        .lb-img { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
     </style>
 </head>
 <body>
@@ -533,7 +433,7 @@ const htmlTemplate = `
     {{$curr := .CurrentPath}}
     {{range .Photos}}
         <div class="photo-card" data-raw-src="/raw/{{if $curr}}{{$curr}}/{{end}}{{.}}" onclick="openLightbox('/raw/{{if $curr}}{{$curr}}/{{end}}{{.}}')">
-            <img src="/thumb/{{if $curr}}{{$curr}}/{{end}}{{.}}" alt="{{.}}" loading="lazy">
+            <img src="/thumb/{{if $curr}}{{$curr}}/{{end}}{{.}}" alt="{{.}}">
             <div class="photo-name">{{.}}</div>
         </div>
     {{end}}
@@ -548,7 +448,10 @@ const htmlTemplate = `
     <span id="lb-close" onclick="closeLightbox()">&times;</span>
     <div class="lb-nav lb-prev" onclick="changeImage(-1)">&#10094;</div>
     <div class="lb-nav lb-next" onclick="changeImage(1)">&#10095;</div>
-    <img id="lb-img" src="">
+    <div id="lb-slider">
+        <img id="lb-img-a" class="lb-img" src="">
+        <img id="lb-img-b" class="lb-img" src="">
+    </div>
 </div>
 
 <script>
@@ -611,43 +514,15 @@ const htmlTemplate = `
         return document.documentElement.scrollHeight > window.innerHeight + 100;
     }
 
-    // 等待所有图片加载完成
-    function waitForImages() {
-        return new Promise((resolve) => {
-            const imgs = document.querySelectorAll('.photo-card img');
-            if (imgs.length === 0) {
-                resolve();
-                return;
-            }
-            let loaded = 0;
-            const total = imgs.length;
-            imgs.forEach(img => {
-                if (img.complete) {
-                    loaded++;
-                    if (loaded === total) resolve();
-                } else {
-                    img.onload = img.onerror = () => {
-                        loaded++;
-                        if (loaded === total) resolve();
-                    };
-                }
-            });
-            // 超时保护
-            setTimeout(resolve, 2000);
-        });
-    }
-
     // PC端自动加载更多，直到可以滚动
     async function ensureScrollable() {
-        // 等待初始图片加载完成
-        await waitForImages();
-        
-        // 如果无法滚动且还有更多内容，继续加载
+        // 等待页面初次渲染完成
+        await new Promise(resolve => setTimeout(resolve, 100));
+
         while (!canScroll() && hasNext && !isLoading) {
             await loadMore();
-            // 等待新内容渲染和图片加载
-            await new Promise(resolve => setTimeout(resolve, 500));
-            await waitForImages();
+            // 给 DOM 一点时间更新（卡片已有 aspect-ratio，不需要等图片加载）
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
     }
 
@@ -693,7 +568,6 @@ const htmlTemplate = `
                     card.onclick = function() { openLightbox(rawSrc); };
 
                     const img = document.createElement('img');
-                    img.loading = "lazy";
                     img.alt = photoName;
                     img.src = thumbSrc;
 
@@ -730,21 +604,48 @@ const htmlTemplate = `
     }
 
     const lightbox = document.getElementById('lightbox');
-    const lbImg = document.getElementById('lb-img');
+    const lbImgA = document.getElementById('lb-img-a');
+    const lbImgB = document.getElementById('lb-img-b');
     let currentImages = [];
     let currentIndex = 0;
+    let lbActive = 'a';     // 当前可见的 slot: 'a' 或 'b'
+    let lbBusy = false;     // 动画进行中或正在加载图片，阻止并发切换
+
+    function lbSlot(s) { return s === 'a' ? lbImgA : lbImgB; }
+    function lbOther(s) { return s === 'a' ? 'b' : 'a'; }
 
     function updateLightboxList() {
         const cards = document.querySelectorAll('.photo-card');
-        currentImages = Array.from(cards).map(card => card.dataset.rawSrc);
+        currentImages = Array.from(cards).map(card => {
+            return new URL(card.dataset.rawSrc, window.location.origin).href;
+        });
+    }
+
+    // 预加载图片（Promise），超时 5 秒兜底
+    function preloadImage(src) {
+        return new Promise(function(resolve) {
+            var img = new Image();
+            img.onload = img.onerror = function() { resolve(); };
+            img.src = src;
+            setTimeout(resolve, 5000);
+        });
     }
 
     function openLightbox(src) {
-        const targetSrc = new URL(src, window.location.origin).href;
-        currentIndex = currentImages.findIndex(s => s === targetSrc);
-        if(currentIndex === -1) currentIndex = 0;
-        
-        lbImg.src = currentImages[currentIndex];
+        var targetSrc = new URL(src, window.location.origin).href;
+        currentIndex = currentImages.findIndex(function(s) { return s === targetSrc; });
+        if (currentIndex === -1) currentIndex = 0;
+
+        // slot A 直接显示当前图片（无动画），slot B 清空
+        lbActive = 'a';
+        lbBusy = false;
+        lbImgA.style.transition = 'none';
+        lbImgA.style.transform = 'translateX(0)';
+        lbImgA.src = currentImages[currentIndex];
+        lbImgB.style.transition = 'none';
+        lbImgB.style.transform = 'translateX(0)';
+        lbImgB.src = '';
+
         lightbox.style.display = 'flex';
         document.body.style.overflow = 'hidden';
     }
@@ -752,44 +653,95 @@ const htmlTemplate = `
     function closeLightbox() {
         lightbox.style.display = 'none';
         document.body.style.overflow = 'auto';
-        lbImg.src = "";
+        lbImgA.src = '';
+        lbImgB.src = '';
+    }
+
+    // 带动画的滑动切换
+    function animateSlide(dir) {
+        // dir: 1 = 下一张 (图片向左滑), -1 = 上一张 (图片向右滑)
+        var oldSlot = lbActive;
+        var newSlot = lbOther(oldSlot);
+        var oldImg = lbSlot(oldSlot);
+        var newImg = lbSlot(newSlot);
+
+        // 新图放到屏幕外
+        newImg.src = currentImages[currentIndex];
+        newImg.style.transition = 'none';
+        newImg.style.transform = dir > 0 ? 'translateX(100%)' : 'translateX(-100%)';
+
+        // 强制回流
+        newImg.offsetHeight;
+
+        // 同时执行动画：旧图滑出，新图滑入
+        oldImg.style.transition = 'transform 0.3s ease';
+        newImg.style.transition = 'transform 0.3s ease';
+        oldImg.style.transform = dir > 0 ? 'translateX(-100%)' : 'translateX(100%)';
+        newImg.style.transform = 'translateX(0)';
+
+        lbActive = newSlot;
+
+        // 动画结束后解锁
+        var onEnd = function() {
+            lbBusy = false;
+            newImg.removeEventListener('transitionend', onEnd);
+        };
+        newImg.addEventListener('transitionend', onEnd);
+        // 兜底：300ms 后强制解锁（transitionend 可能不触发）
+        setTimeout(function() { lbBusy = false; }, 350);
     }
 
     async function changeImage(dir) {
-        // 向左切换
-        if (dir < 0) {
-            currentIndex += dir;
-            if (currentIndex < 0) currentIndex = currentImages.length - 1;
-            lbImg.src = currentImages[currentIndex];
-            return;
-        }
-        
-        // 向右切换
-        currentIndex += dir;
-        
-        // 如果到达最后一张，检查是否需要加载更多
-        if (currentIndex >= currentImages.length) {
-            // 如果有更多照片且不在加载中，先加载更多
+        if (lbBusy) return; // 动画/加载中，忽略
+        lbBusy = true;
+
+        var newIndex = currentIndex + dir;
+
+        // 超出范围 → 尝试加载更多
+        if (newIndex >= currentImages.length) {
             if (hasNext && !isLoading) {
                 await loadMore();
-                // loadMore() 已经调用了 updateLightboxList()，现在应该可以继续了
-                if (currentIndex < currentImages.length) {
-                    lbImg.src = currentImages[currentIndex];
-                } else {
-                    // 如果加载后还是没有更多，循环回第一张
-                    currentIndex = 0;
-                    lbImg.src = currentImages[currentIndex];
+                if (newIndex >= currentImages.length) {
+                    newIndex = 0;
                 }
             } else {
-                // 没有更多照片了，循环回第一张
-                currentIndex = 0;
-                lbImg.src = currentImages[currentIndex];
+                newIndex = 0;
             }
-        } else {
-            // 正常切换
-            lbImg.src = currentImages[currentIndex];
+        } else if (newIndex < 0) {
+            newIndex = currentImages.length - 1;
         }
+
+        currentIndex = newIndex;
+
+        // 先预加载原图，避免动画时显示空白
+        await preloadImage(currentImages[currentIndex]);
+        // 预加载期间可能被 openLightbox 打断，检查状态
+        if (!lightbox.style.display || lightbox.style.display === 'none') {
+            lbBusy = false;
+            return;
+        }
+
+        animateSlide(dir);
     }
+
+    // 移动端左右滑动切换图片
+    let touchStartX = 0;
+    let touchStartY = 0;
+
+    lightbox.addEventListener('touchstart', function(e) {
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+    }, {passive: true});
+
+    lightbox.addEventListener('touchend', function(e) {
+        const dx = e.changedTouches[0].clientX - touchStartX;
+        const dy = e.changedTouches[0].clientY - touchStartY;
+        const minSwipe = 50;
+
+        if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > minSwipe) {
+            changeImage(dx > 0 ? -1 : 1);
+        }
+    });
 
     document.addEventListener('keydown', function(e) {
         if (lightbox.style.display === 'flex') {
